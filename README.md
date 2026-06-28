@@ -8,7 +8,7 @@ Each subfolder contains its own `README.md` with module-specific usage notes. Th
 
 Large trained model files, registration tools, templates, and related resources are available from Google Drive:
 
-<https://drive.google.com/drive/folders/1Nlues7rmcTzgHkqkHtFooKLE3Kc7l32g>
+https://drive.google.com/drive/folders/1Nlues7rmcTzgHkqkHtFooKLE3Kc7l32g?usp=sharing
 
 After downloading, place the files in the corresponding module folders as described in each subfolder README.
 
