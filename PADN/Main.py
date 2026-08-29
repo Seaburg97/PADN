@@ -25,6 +25,31 @@ from region_attention import (
     REGION_NAMES,
 )
 
+
+def build_model_from_config(config, region_masks=None):
+    """Build any supported architecture directly from this module."""
+    model_mode = config.get('model_mode', 'current_strong_prior')
+    return DualChannelPredictor(
+        dropout=float(config.get('dropout', 0.5)),
+        use_region_attention=bool(config.get('use_region_attention', True)),
+        region_masks=region_masks,
+        model_mode=model_mode,
+    )
+
+
+def extract_model_state(checkpoint):
+    """Accept a full checkpoint or a minimal model state dictionary."""
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        return checkpoint['model_state_dict']
+    return checkpoint
+
+
+def make_group_norm(channels, max_groups=8):
+    groups = min(max_groups, channels)
+    while channels % groups != 0:
+        groups -= 1
+    return nn.GroupNorm(groups, channels)
+
 def set_seed(seed=41):
     random.seed(seed)
     np.random.seed(seed)
@@ -121,7 +146,7 @@ def infer_patience_counter_from_history(training_history):
 
 def load_model_state_compat(model, checkpoint):
     missing_keys, unexpected_keys = model.load_state_dict(
-        checkpoint['model_state_dict'],
+        extract_model_state(checkpoint),
         strict=False,
     )
     if missing_keys:
@@ -223,16 +248,16 @@ class ResBlock3D(nn.Module):
     def __init__(self, in_channels, out_channels, stride=1):
         super().__init__()
         self.conv1 = nn.Conv3d(in_channels, out_channels, 3, stride, 1, bias=False)
-        self.bn1 = nn.BatchNorm3d(out_channels)
+        self.bn1 = make_group_norm(out_channels)
         self.conv2 = nn.Conv3d(out_channels, out_channels, 3, 1, 1, bias=False)
-        self.bn2 = nn.BatchNorm3d(out_channels)
+        self.bn2 = make_group_norm(out_channels)
         self.cbam = CBAM(out_channels)
 
         self.shortcut = nn.Sequential()
         if stride != 1 or in_channels != out_channels:
             self.shortcut = nn.Sequential(
                 nn.Conv3d(in_channels, out_channels, 1, stride, bias=False),
-                nn.BatchNorm3d(out_channels)
+                make_group_norm(out_channels)
             )
 
     def forward(self, x):
@@ -249,7 +274,7 @@ class DepthAttention(nn.Module):
         self.depth_conv = nn.Sequential(
             nn.Conv3d(channels, channels, kernel_size=(3, 1, 1),
                      padding=(1, 0, 0), bias=False),
-            nn.BatchNorm3d(channels),
+            make_group_norm(channels),
             nn.ReLU(inplace=True)
         )
         self.attention = nn.Sequential(
@@ -294,12 +319,12 @@ class EnhancedChangeAwareModule(nn.Module):
         super().__init__()
         self.diff_direction = nn.Sequential(
             nn.Conv3d(channels, channels, 3, 1, 1, bias=False),
-            nn.BatchNorm3d(channels),
+            make_group_norm(channels),
             nn.ReLU(inplace=True)
         )
         self.diff_magnitude = nn.Sequential(
             nn.Conv3d(channels, channels, 3, 1, 1, bias=False),
-            nn.BatchNorm3d(channels),
+            make_group_norm(channels),
             nn.Sigmoid()
         )
 
@@ -338,7 +363,7 @@ class MultiScaleFeaturePyramid(nn.Module):
         ])
         self.output_conv = nn.Sequential(
             nn.Conv3d(128, 128, 3, 1, 1),           
-            nn.BatchNorm3d(128),
+            make_group_norm(128),
             nn.ReLU(inplace=True)
         )
 
@@ -365,7 +390,7 @@ class EnhancedDualStreamNet(nn.Module):
 
         self.stem = nn.Sequential(
             nn.Conv3d(in_channels, 16, 7, 2, 3, bias=False),         
-            nn.BatchNorm3d(16),
+            make_group_norm(16),
             nn.ReLU(inplace=True),
             nn.MaxPool3d(3, 2, 1)
         )
@@ -378,6 +403,12 @@ class EnhancedDualStreamNet(nn.Module):
             ResBlock3D(16, 32, 2),
             ResBlock3D(32, 32, 1)
         )
+
+        # Stable Grad-CAM targets before and after phase-specific prior guidance.
+        self.pre_image_cam_layer = nn.Identity()
+        self.post_image_cam_layer = nn.Identity()
+        self.pre_prior_guided_cam_layer = nn.Identity()
+        self.post_prior_guided_cam_layer = nn.Identity()
 
         if use_region_attention:
             self.pre_change_region_attention = RegionReconstructionModule(
@@ -430,12 +461,16 @@ class EnhancedDualStreamNet(nn.Module):
         return_branch_features=False,
         enable_region_prior=True,
         use_region_attention_forward=True,
+        pre_prior_multiplier=None,
+        post_prior_multiplier=None,
     ):
         pre_feat = self.stem(pre)
         post_feat = self.stem(post)
 
-        pre_mid = self.pre_branch(pre_feat)
-        post_mid = self.post_branch(post_feat)
+        pre_image_feature = self.pre_image_cam_layer(self.pre_branch(pre_feat))
+        post_image_feature = self.post_image_cam_layer(self.post_branch(post_feat))
+        pre_mid = pre_image_feature
+        post_mid = post_image_feature
 
         pre_response = None
         post_response = None
@@ -458,24 +493,30 @@ class EnhancedDualStreamNet(nn.Module):
         ):
             if return_details:
                 pre_mid, pre_change_region_weights, pre_change_region_details = self.pre_change_region_attention(
-                    pre_mid, pre_region_masks, volumes, return_details=True, enable_prior=enable_region_prior
+                    pre_mid, pre_region_masks, volumes, return_details=True,
+                    enable_prior=enable_region_prior, prior_multiplier=pre_prior_multiplier,
                 )
                 post_mid, post_change_region_weights, post_change_region_details = self.post_change_region_attention(
-                    post_mid, post_region_masks, volumes, return_details=True, enable_prior=enable_region_prior
+                    post_mid, post_region_masks, volumes, return_details=True,
+                    enable_prior=enable_region_prior, prior_multiplier=post_prior_multiplier,
                 )
             else:
                 pre_mid, pre_change_region_weights = self.pre_change_region_attention(
-                    pre_mid, pre_region_masks, volumes, enable_prior=enable_region_prior
+                    pre_mid, pre_region_masks, volumes, enable_prior=enable_region_prior,
+                    prior_multiplier=pre_prior_multiplier,
                 )
                 post_mid, post_change_region_weights = self.post_change_region_attention(
-                    post_mid, post_region_masks, volumes, enable_prior=enable_region_prior
+                    post_mid, post_region_masks, volumes, enable_prior=enable_region_prior,
+                    prior_multiplier=post_prior_multiplier,
                 )
             if pre_change_region_weights is not None and post_change_region_weights is not None:
                 change_region_weights = (pre_change_region_weights + post_change_region_weights) / 2.0
             else:
                 change_region_weights = pre_change_region_weights if pre_change_region_weights is not None else post_change_region_weights
 
-        fused = self.change_aware(pre_mid, post_mid)
+        pre_guided_feature = self.pre_prior_guided_cam_layer(pre_mid)
+        post_guided_feature = self.post_prior_guided_cam_layer(post_mid)
+        fused = self.change_aware(pre_guided_feature, post_guided_feature)
         change_feat = fused
 
         feat1 = self.layer1(fused)
@@ -494,8 +535,12 @@ class EnhancedDualStreamNet(nn.Module):
             }
             if return_branch_features:
                 details['branch_features'] = {
-                    'pre_mid_feat': pre_mid,
-                    'post_mid_feat': post_mid,
+                    'pre_image_feature': pre_image_feature,
+                    'post_image_feature': post_image_feature,
+                    'pre_guided_feature': pre_guided_feature,
+                    'post_guided_feature': post_guided_feature,
+                    'pre_mid_feat': pre_guided_feature,
+                    'post_mid_feat': post_guided_feature,
                 }
             weights = {
                 'change': change_region_weights,
@@ -514,7 +559,9 @@ class DualChannelPredictor(nn.Module):
     ):
         super().__init__()
         self.model_mode = model_mode
-        self.enable_strong_region_prior = use_region_attention and model_mode == 'current_strong_prior'
+        self.enable_strong_region_prior = use_region_attention and model_mode in {
+            'current_strong_prior', 'phase_prior_guided_change'
+        }
 
         self.dual_stream = EnhancedDualStreamNet(
             in_channels=1,
@@ -566,6 +613,15 @@ class DualChannelPredictor(nn.Module):
             nn.Linear(64, 6)
         )
 
+    def get_gradcam_target_layers(self):
+        """Return image-only and prior-guided targets for both phases."""
+        return {
+            'pre_image': self.dual_stream.pre_image_cam_layer,
+            'post_image': self.dual_stream.post_image_cam_layer,
+            'pre_prior_guided': self.dual_stream.pre_prior_guided_cam_layer,
+            'post_prior_guided': self.dual_stream.post_prior_guided_cam_layer,
+        }
+
     def forward(
         self,
         pre_ct,
@@ -576,6 +632,7 @@ class DualChannelPredictor(nn.Module):
         return_details=False,
         enable_region_prior=True,
         disable_all_priors=False,
+        prior_multipliers=None,
     ):
         batch_size = pre_ct.size(0)
         region_masks_batch = pre_region_masks
@@ -593,20 +650,34 @@ class DualChannelPredictor(nn.Module):
         if post_region_masks_batch is None:
             post_region_masks_batch = region_masks_batch
 
+        pre_prior_multiplier = None
+        post_prior_multiplier = None
+        if prior_multipliers is not None:
+            if not isinstance(prior_multipliers, dict) or set(prior_multipliers) - {'pre', 'post'}:
+                raise ValueError("prior_multipliers must contain only 'pre' and 'post' tensors")
+            pre_prior_multiplier = prior_multipliers.get('pre')
+            post_prior_multiplier = prior_multipliers.get('post')
+
         need_branch_details = return_details or self.model_mode == 'prepost_prior_attention'
         if need_branch_details:
             img_feat, region_weights, region_details = self.dual_stream(
                 pre_ct, post_ct, region_masks_batch, post_region_masks_batch, volumes,
                 return_details=True,
-                return_branch_features=self.model_mode == 'prepost_prior_attention',
+                return_branch_features=self.model_mode in {
+                    'prepost_prior_attention', 'phase_prior_guided_change'
+                },
                 enable_region_prior=enable_region_prior and (not disable_all_priors),
                 use_region_attention_forward=use_region_attention_forward,
+                pre_prior_multiplier=pre_prior_multiplier,
+                post_prior_multiplier=post_prior_multiplier,
             )
         else:
             img_feat, region_weights = self.dual_stream(
                 pre_ct, post_ct, region_masks_batch, post_region_masks_batch, volumes,
                 enable_region_prior=enable_region_prior and (not disable_all_priors),
                 use_region_attention_forward=use_region_attention_forward,
+                pre_prior_multiplier=pre_prior_multiplier,
+                post_prior_multiplier=post_prior_multiplier,
             )
             region_details = None
 
@@ -1042,6 +1113,9 @@ def validate(
                             details['region']['change_feat'],
                             (pre_region_masks + post_region_masks) / 2.0,
                         )
+                    # Keep 3D branch features for Grad-CAM only, not cohort-level exports.
+                    details.get('region', {}).pop('branch_features', None)
+                    details.get('region', {}).pop('change_feat', None)
                     _append_details_buffer(all_details, details)
                 else:
                     outputs, region_weights = model(
@@ -1324,12 +1398,8 @@ def run_training_pipeline(config, df_train, df_val, df_test, device, run_name='m
         generator_seed=dataloader_seed + 3,
     )
 
-    model = DualChannelPredictor(
-        dropout=config['dropout'],
-        use_region_attention=config['use_region_attention'],
-        region_masks=None,
-        model_mode=config.get('model_mode', 'current_strong_prior'),
-    )
+    # The new architecture receives individualized pre/post masks per batch.
+    model = build_model_from_config(config, region_masks=None)
     model = model.to(device)
 
     print(f"\nModel config: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
@@ -1544,7 +1614,7 @@ def run_training_pipeline(config, df_train, df_val, df_test, device, run_name='m
             print(f"Warning Validation setKappa ({patience_counter}/{config['early_stopping_patience']})")
 
             if patience_counter >= config['early_stopping_patience']:
-                print(f"\nEarly stopping triggered！{config['early_stopping_patience']}Kappa")
+                print(f"\nEarly stopping triggered after {config['early_stopping_patience']} epochs without Kappa improvement")
                 print(f"Best Kappa: {best_val_kappa:.4f}")
                 break
 
@@ -1607,7 +1677,7 @@ def run_training_pipeline(config, df_train, df_val, df_test, device, run_name='m
 
     if not config.get('test_only', False):
         print(f"\n{'='*60}")
-        print(f"TrainingDone！Validation setKappa: {best_val_kappa:.4f}")
+        print(f"Training completed. Best validation Kappa: {best_val_kappa:.4f}")
         print(f"Total training time: {(time.time() - start_time) / 60:.2f} ")
         print('='*60)
 
@@ -1947,8 +2017,8 @@ def run_training_pipeline(config, df_train, df_val, df_test, device, run_name='m
         return t_kappa, t_sens, t_f1, t_auc, t_preds, t_labels, t_probs, t_rw
 
     result_kappa        = _run_test('best_kappa.pth',        'Best Kappa')
-    result_kappa_recall = _run_test('best_kappa_recall.pth', 'Best √(Kappa×Recall)')
-    result_kappa_f1     = _run_test('best_kappa_f1.pth',     'Best √(Kappa×F1)')
+    result_kappa_recall = _run_test('best_kappa_recall.pth', 'Best sqrt(Kappa x Recall)')
+    result_kappa_f1     = _run_test('best_kappa_f1.pth',     'Best sqrt(Kappa x F1)')
 
     if result_kappa is not None:
         test_kappa, test_sensitivity, test_f1, test_binary_auc, test_preds, test_labels, test_probs, test_region_weights = result_kappa
@@ -1963,8 +2033,8 @@ def run_training_pipeline(config, df_train, df_val, df_test, device, run_name='m
 
     model_specs = [
         ('best_kappa',        'Best Kappa',          'Blues'),
-        ('best_kappa_recall', 'Best √(Kappa×Recall)', 'Greens'),
-        ('best_kappa_f1',     'Best √(Kappa×F1)',    'Oranges'),
+        ('best_kappa_recall', 'Best sqrt(Kappa x Recall)', 'Greens'),
+        ('best_kappa_f1',     'Best sqrt(Kappa x F1)',    'Oranges'),
     ]
 
     for suffix, title, cmap_color in model_specs:
@@ -2004,7 +2074,7 @@ def run_training_pipeline(config, df_train, df_val, df_test, device, run_name='m
                     xticklabels=[f'mRS {i}' for i in range(7)],
                     yticklabels=[f'mRS {i}' for i in range(7)],
                     ax=axes[1], cbar_kws={'label': 'Count'})
-        axes[1].set_title(f'{test_name} — {title} (n={len(test_labels_cm)})\nAcc={test_acc_cm:.2%}',
+        axes[1].set_title(f'{test_name} - {title} (n={len(test_labels_cm)})\nAcc={test_acc_cm:.2%}',
                           fontsize=14, fontweight='bold')
         axes[1].set_xlabel('Predicted Label', fontsize=12)
         axes[1].set_ylabel('True Label', fontsize=12)
@@ -2141,8 +2211,9 @@ def get_config():
         'poor_outcome_weight_multiplier': 1.0,
 
         'use_region_attention': True,
-        'disable_all_priors': True,
-        'model_mode': 'prepost_prior_attention',
+        # Each phase is prior-guided before pre/post change-aware fusion.
+        'disable_all_priors': False,
+        'model_mode': 'phase_prior_guided_change',
         'space_mode': 'current',
         'region_prior_mode': 'current',
 
