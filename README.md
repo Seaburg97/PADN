@@ -1,3 +1,6 @@
+
+<img width="1108" height="794" alt="image" src="https://github.com/user-attachments/assets/ff834ecf-f828-4867-837f-8c62a8fa1e7b" />
+
 # PADN Prediction Code
 
 This repository contains the code used for image preprocessing, individualized vascular territory mapping, PADN prediction, clinical prediction, and PADN-clinical fusion prediction.
